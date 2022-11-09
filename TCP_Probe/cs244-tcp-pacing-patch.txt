@@ -1,0 +1,449 @@
+diff --git a/Documentation/networking/ip-sysctl.txt b/Documentation/networking/ip-sysctl.txt
+index 1514ea3..67992e7 100644
+--- a/Documentation/networking/ip-sysctl.txt
++++ b/Documentation/networking/ip-sysctl.txt
+@@ -368,6 +368,11 @@ tcp_orphan_retries - INTEGER
+ 	you should think about lowering this value, such sockets
+ 	may consume significant resources. Cf. tcp_max_orphans.
+ 
++tcp_pacing - BOOLEAN
++	0: Send each window as a burst of segments
++	1: Spread segments all across RTT
++	Default: 0
++
+ tcp_reordering - INTEGER
+ 	Maximal reordering of packets in a TCP stream.
+ 	Default: 3
+diff --git a/include/linux/sysctl.h b/include/linux/sysctl.h
+index c34b4c8..4430687 100644
+--- a/include/linux/sysctl.h
++++ b/include/linux/sysctl.h
+@@ -425,6 +425,9 @@ enum
+ 	NET_TCP_ALLOWED_CONG_CONTROL=123,
+ 	NET_TCP_MAX_SSTHRESH=124,
+ 	NET_TCP_FRTO_RESPONSE=125,
++#ifdef CONFIG_TCP_PACING
++	NET_TCP_PACING=131,
++#endif
+ };
+ 
+ enum {
+diff --git a/include/linux/tcp.h b/include/linux/tcp.h
+index 5f359db..9bec89e 100644
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -459,6 +459,18 @@ struct tcp_sock {
+ 
+ 	int			linger2;
+ 
++#ifdef CONFIG_TCP_PACING
++	struct {
++		struct timer_list timer;
++		__u16	count;
++		__u16	burst;
++		__u8 	lock;
++		__u16 	delta:15,
++			disabled:1;
++		__u16	sent;
++	} pacing;
++#endif
++
+ /* Receiver side RTT estimation */
+ 	struct {
+ 		u32	rtt;
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 851f8fa..b535f74 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -255,6 +255,60 @@ extern int sysctl_tcp_thin_dupack;
+ extern int sysctl_tcp_early_retrans;
+ extern int sysctl_tcp_challenge_ack_limit;
+ 
++#ifdef CONFIG_TCP_PACING
++extern int sysctl_tcp_pacing;
++extern void __tcp_pacing_recalc_delta(struct sock *sk);
++extern void __tcp_pacing_reset_timer(struct sock *sk);
++
++static inline int tcp_pacing_enabled(struct sock *sk)
++{
++	return (sysctl_tcp_pacing && !tcp_sk(sk)->pacing.disabled);
++}
++
++static inline void tcp_pacing_recalc_delta(struct sock *sk)
++{
++	if (tcp_pacing_enabled(sk))
++		__tcp_pacing_recalc_delta(sk);
++}
++
++static inline void tcp_pacing_reset_timer(struct sock *sk)
++{
++	if (tcp_pacing_enabled(sk))
++		__tcp_pacing_reset_timer(sk);
++}
++
++static inline void tcp_pacing_lock_tx(struct sock *sk)
++{
++	if (tcp_pacing_enabled(sk))
++		tcp_sk(sk)->pacing.lock=1;
++}
++
++static inline int tcp_pacing_locked(struct sock *sk)
++{
++	if (tcp_pacing_enabled(sk))
++		return tcp_sk(sk)->pacing.lock;
++	else
++		return 0;
++}
++
++static inline int tcp_pacing_burst(struct sock *sk)
++{
++	if (tcp_pacing_enabled(sk))
++		return (max_t(u32,1,tcp_sk(sk)->pacing.burst));
++	else
++		return 0;
++}
++
++#else
++static inline void tcp_pacing_recalc_delta(struct sock *sk) {};
++static inline void tcp_pacing_reset_timer(struct sock *sk) {};
++static inline void tcp_pacing_lock_tx(struct sock *sk) {};
++
++#define tcp_pacing_locked(sk) 0
++#define tcp_pacing_enabled(sk) 0
++#define tcp_pacing_burst(sk) 0
++#endif
++
+ extern atomic_long_t tcp_memory_allocated;
+ extern struct percpu_counter tcp_sockets_allocated;
+ extern int tcp_memory_pressure;
+@@ -1611,4 +1665,10 @@ static inline struct tcp_extend_values *tcp_xv(struct request_values *rvp)
+ extern void tcp_v4_init(void);
+ extern void tcp_init(void);
+ 
++#ifdef CONFIG_TCP_PACING
++extern void tcp_pacing_recalc_delta (struct sock *);
++extern void tcp_reset_pacing_timer (struct sock *);
++#endif
++
++
+ #endif	/* _TCP_H */
+diff --git a/kernel/sysctl_binary.c b/kernel/sysctl_binary.c
+index a650694..47b00a9 100644
+--- a/kernel/sysctl_binary.c
++++ b/kernel/sysctl_binary.c
+@@ -414,6 +414,9 @@ static const struct bin_table bin_net_ipv4_table[] = {
+ 
+ 	{ CTL_INT,	NET_IPV4_IPFRAG_SECRET_INTERVAL,	"ipfrag_secret_interval" },
+ 	/* NET_IPV4_IPFRAG_MAX_DIST "ipfrag_max_dist" no longer used */
++#ifdef CONFIG_TCP_PACING
++	{ CTL_INT,	NET_TCP_PACING,			"tcp_pacing" },
++#endif
+ 
+ 	{ CTL_INT,	2088 /* NET_IPQ_QMAX */,		"ip_queue_maxlen" },
+ 
+diff --git a/net/ipv4/Kconfig b/net/ipv4/Kconfig
+index 20f1cb5..3244b99 100644
+--- a/net/ipv4/Kconfig
++++ b/net/ipv4/Kconfig
+@@ -600,6 +600,14 @@ choice
+ 
+ endchoice
+ 
++config TCP_PACING
++	default n
++	bool "TCP Spacing and bandwidth estimation"
++	---help---
++	TCP spacing and Initial BW estimation: a couple of tiny TCP enhancements that
++	could improve performance in long-delay channels.
++	See Documentation/networking/ip-sysctl.txt for how to enable them.
++
+ endif
+ 
+ config TCP_CONG_CUBIC
+diff --git a/net/ipv4/sysctl_net_ipv4.c b/net/ipv4/sysctl_net_ipv4.c
+index e6791f2..7ef62b0 100644
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@ -716,6 +716,15 @@ static struct ctl_table ipv4_table[] = {
+ 		.proc_handler	= proc_dointvec_minmax,
+ 		.extra1		= &zero
+ 	},
++#ifdef CONFIG_TCP_PACING
++	{
++		.procname	= "tcp_pacing",
++		.data		= &sysctl_tcp_pacing,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec,
++	},
++#endif  /* CONFIG_TCP_PACING */
+ 	{ }
+ };
+ 
+diff --git a/net/ipv4/tcp_cong.c b/net/ipv4/tcp_cong.c
+index 41ef65d..42f1e87 100644
+--- a/net/ipv4/tcp_cong.c
++++ b/net/ipv4/tcp_cong.c
+@@ -285,6 +285,11 @@ bool tcp_is_cwnd_limited(const struct sock *sk, u32 in_flight)
+ 	const struct tcp_sock *tp = tcp_sk(sk);
+ 	u32 left;
+ 
++#ifdef CONFIG_TCP_PACING
++	if(sysctl_tcp_pacing)
++		return true;
++#endif
++
+ 	if (in_flight >= tp->snd_cwnd)
+ 		return true;
+ 
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index 19c430c..63fce62 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -3821,6 +3821,8 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
+ 	if (after(ack, prior_snd_una))
+ 		flag |= FLAG_SND_UNA_ADVANCED;
+ 
++	tcp_pacing_recalc_delta(sk);
++
+ 	if (sysctl_tcp_abc) {
+ 		if (icsk->icsk_ca_state < TCP_CA_CWR)
+ 			tp->bytes_acked += ack - prior_snd_una;
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index 305aafe..be9060d 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -855,6 +855,15 @@ static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
+ 	*(((__be16 *)th) + 6)	= htons(((tcp_header_size >> 2) << 12) |
+ 					tcb->tcp_flags);
+ 
++	if (tcp_pacing_enabled(sk)) {
++		tp->pacing.sent++;
++		if ((tp->pacing.burst) && (tp->pacing.burst <= tp->pacing.sent)) {
++			tcp_pacing_lock_tx(sk);
++			tp->pacing.sent = 0;
++			tcp_pacing_reset_timer(sk);
++		}
++	}
++
+ 	if (unlikely(tcb->tcp_flags & TCPHDR_SYN)) {
+ 		/* RFC1323: The window in SYN & SYN/ACK segments
+ 		 * is never scaled.
+@@ -1554,6 +1563,12 @@ static bool tcp_tso_should_defer(struct sock *sk, struct sk_buff *skb)
+ 	u32 send_win, cong_win, limit, in_flight;
+ 	int win_divisor;
+ 
++	/* TCP spacing conflicts with John's algorithm, so turn it off
++	 * in case of rate-based sender.
++	 */
++	if(tcp_pacing_enabled(sk))
++		goto send_now;
++
+ 	if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
+ 		goto send_now;
+ 
+@@ -1764,10 +1779,12 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
+ 	struct sk_buff *skb;
+ 	unsigned int tso_segs, sent_pkts;
+ 	int cwnd_quota;
++#ifndef CONFIG_TCP_PACING
+ 	int result;
+-
++#endif
+ 	sent_pkts = 0;
+ 
++#ifndef CONFIG_TCP_PACING
+ 	if (!push_one) {
+ 		/* Do MTU probing. */
+ 		result = tcp_mtu_probe(sk);
+@@ -1779,6 +1796,9 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
+	}
+
+	while ((skb = tcp_send_head(sk))) {
++#else
++while ((skb = tcp_send_head(sk)) && (!tcp_pacing_enabled(sk) || tp->pacing.sent < tcp_pacing_burst(sk))) {
++#endif /* CONFIG_TCP_PACING */
+		unsigned int limit;
+
+		tso_segs = tcp_init_tso_segs(sk, skb, mss_now);
+@@ -1794,6 +1814,9 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
+ 		if (unlikely(!tcp_snd_wnd_test(tp, skb, mss_now)))
+ 			break;
+ 
++		if (tcp_pacing_locked(sk))
++			break;
++
+ 		if (tso_segs == 1) {
+ 			if (unlikely(!tcp_nagle_test(tp, skb, mss_now,
+ 						     (tcp_skb_is_last(sk, skb) ?
+@@ -2168,6 +2191,9 @@ int tcp_retransmit_skb(struct sock *sk, struct sk_buff *skb)
+ 		}
+ 	}
+ 
++	if (tcp_pacing_locked(sk))
++		return -EAGAIN;
++
+ 	/* Make a copy, if the first transmission SKB clone we made
+ 	 * is still in somebody's hands, else make a clone.
+ 	 */
+diff --git a/net/ipv4/tcp_timer.c b/net/ipv4/tcp_timer.c
+index e911e6c..ab0a85e 100644
+--- a/net/ipv4/tcp_timer.c
++++ b/net/ipv4/tcp_timer.c
+@@ -36,10 +36,21 @@ static void tcp_write_timer(unsigned long);
+ static void tcp_delack_timer(unsigned long);
+ static void tcp_keepalive_timer (unsigned long data);
+ 
++#ifdef CONFIG_TCP_PACING
++int sysctl_tcp_pacing = 0;
++EXPORT_SYMBOL_GPL(sysctl_tcp_pacing);
++static void tcp_pacing_timer(unsigned long data);
++#endif
++
+ void tcp_init_xmit_timers(struct sock *sk)
+ {
+ 	inet_csk_init_xmit_timers(sk, &tcp_write_timer, &tcp_delack_timer,
+ 				  &tcp_keepalive_timer);
++#ifdef CONFIG_TCP_PACING
++	init_timer(&(tcp_sk(sk)->pacing.timer));
++	tcp_sk(sk)->pacing.timer.function=&tcp_pacing_timer;
++	tcp_sk(sk)->pacing.timer.data = (unsigned long) sk;
++#endif
+ }
+ EXPORT_SYMBOL(tcp_init_xmit_timers);
+ 
+@@ -265,6 +276,134 @@ out_unlock:
+ 	sock_put(sk);
+ }
+ 
++#ifdef CONFIG_TCP_PACING
++/* Routines for TCP Pacing.
++ *
++ * Amit Aggarwal, Stefan Savage, and Thomas Anderson, "Understanding the Performance of TCP Pacing"
++ * Proc. of the IEEE INFOCOM 2000 Conference on Computer Communications, March 2000, pages 1157 - 1165.
++ *
++ * This is the timer used to spread packets.
++ * a delta value is computed on rtt/cwnd,
++ * and will be our expire interval.
++ */
++static void tcp_pacing_timer(unsigned long data)
++{
++	struct sock *sk = (struct sock*) data;
++	struct tcp_sock *tp = tcp_sk(sk);
++
++	if (!sysctl_tcp_pacing)
++		return;
++
++	bh_lock_sock(sk);
++	if (sock_owned_by_user(sk)) {
++		/* Try again later */
++		if (!mod_timer(&tp->pacing.timer, jiffies + 1))
++			sock_hold(sk);
++		goto out_unlock;
++	}
++
++	if (sk->sk_state == TCP_CLOSE)
++		goto out;
++
++	/* Unlock sending, so when next ack is received it will pass.
++	 * If there are no packets scheduled, do nothing.
++	 */
++	tp->pacing.lock = 0;
++
++	if (!tcp_send_head(sk)){
++		/* Sending queue empty */
++		goto out;
++	}
++
++	/* Handler */
++	if(tp->lost_out)
++		tcp_xmit_retransmit_queue(sk);
++	else
++		tcp_push_pending_frames(sk);
++
++out:
++	if (tcp_memory_pressure)
++		sk_mem_reclaim(sk);
++
++out_unlock:
++	bh_unlock_sock(sk);
++	sock_put(sk);
++}
++
++/*
++ * The timer has to be restarted when a segment is sent out.
++ */
++void __tcp_pacing_reset_timer(struct sock *sk)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++	__u32 timeout = jiffies + tp->pacing.delta;
++
++	if (!mod_timer(&tp->pacing.timer, timeout))
++		sock_hold(sk);
++}
++EXPORT_SYMBOL(__tcp_pacing_reset_timer);
++
++/*
++ * This routine computes tcp_pacing delay, using
++ * a simplified uniform pacing policy.
++ */
++void __tcp_pacing_recalc_delta(struct sock *sk)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++	__u32 window = (tp->snd_cwnd)<<3;
++	__u32 srtt = tp->srtt;
++	__u32 round = 0;
++	__u32 curmss = tp->mss_cache;
++	int state = inet_csk(sk)->icsk_ca_state;
++
++	if (state == TCP_CA_Recovery && tp->snd_cwnd < tp->snd_ssthresh)
++		window = tp->snd_ssthresh << 3;
++
++	if (tp->snd_wnd/curmss < tp->snd_cwnd)
++		window = (tp->snd_wnd / curmss) << 3;
++
++	if (window>1 && srtt && state != TCP_CA_Recovery) {
++		if (window <= srtt){
++			tp->pacing.delta = (srtt/window);
++			if (srtt % window)
++				round=((srtt / (srtt % window)));
++			else
++				round=0;
++			if (round && (tp->pacing.count >= round))
++				tp->pacing.count = 0;
++			if (round && tp->pacing.count == 0)
++				tp->pacing.delta++;
++			tp->pacing.burst = 1;
++		} else {
++			tp->pacing.delta = 1;
++			tp->pacing.burst = (window / srtt);
++			if (window % srtt)
++				round = ( (srtt / (window % srtt)));
++			else
++				round = 0;
++			if (round && tp->pacing.count >= (round)){
++				tp->pacing.count = 0;
++				if (round && tp->pacing.count == 0)
++					tp->pacing.burst++;
++			}
++		}
++		tp->pacing.count++;
++	} else {
++		tp->pacing.delta = 0;
++		tp->pacing.burst = 1;
++	}
++
++	if ((tp->pacing.burst) && (tp->pacing.burst <= tp->pacing.sent)) {
++		tcp_pacing_lock_tx(sk);
++		tp->pacing.sent = 0;
++		tcp_pacing_reset_timer(sk);
++	}
++}
++
++EXPORT_SYMBOL(__tcp_pacing_recalc_delta);
++
++#endif
++
+ static void tcp_probe_timer(struct sock *sk)
+ {
+ 	struct inet_connection_sock *icsk = inet_csk(sk);
