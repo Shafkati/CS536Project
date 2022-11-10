@@ -96,8 +96,8 @@ class OutcastTopo(Topo):
         aggrSwitch = self.addSwitch('s2')
         for i in range(1, n+1):
             h = self.addHost('h'+str(i), **hconfig)
-            self.addLink(h, aggrSwitch, port1=0, port2=i+1, **lconfig)    
-	
+            self.addLink(h, aggrSwitch, port1=0, port2=i+1, **lconfig)
+
         self.addLink(h0, s1, port1=0, port2=h0Switch, **lconfig)
         self.addLink(aggrSwitch, s1, port1=1, port2=aggrSwitchPort, **lconfig)
         # self.addLink(s1, receiver, port1=switchRec, port2=0, **lconfig)
@@ -154,7 +154,7 @@ def run_outcast_expt(net, n):
     seconds = args.time
 
     # Start the bandwidth and cwnd monitors in the background
-    monitor = Process(target=monitor_devs_ng, 
+    monitor = Process(target=monitor_devs_ng,
             args=('%s/bwm.txt' % args.dir, 1.0))
     monitor.start()
     start_tcpprobe()
@@ -175,7 +175,7 @@ def run_outcast_expt(net, n):
     # Hint: Use sendCmd() and waitOutput() to start iperf and wait for them to finish
     # iperf command to start flow: 'iperf -c %s -p %s -t %d -i 1 -yc > %s/iperf_%s.txt' % (recvr.IP(), 5001, seconds, args.dir, node_name)
     # Hint (not important): You may use progress(t) to track your experiment progress
-    
+
     for i in range(0, n+1):
         node_name = 'h' + str(i)
         # This was indented outside earlier
@@ -205,6 +205,12 @@ def main():
     "Create and run experiment"
     start = time()
 
+
+    if(args.pacing):
+        os.system("sysctl -w net.ipv4.tcp_pacing=1")
+    else:
+        os.system("sysctl -w net.ipv4.tcp_pacing=0")
+
     topo = OutcastTopo(n=args.n)
 
     host = custom(CPULimitedHost, cpu=.15)  # 15% of system bandwidth
@@ -214,7 +220,7 @@ def main():
     net = Mininet(topo=topo, link=link)
 
     net.start()
-    
+
     # cprint("*** Dumping network connections:", "green")
     print("*** Dumping network connections:")
     dumpNetConnections(net)
@@ -241,4 +247,3 @@ def main():
 if __name__ == '__main__':
     check_prereqs()
     main()
-
